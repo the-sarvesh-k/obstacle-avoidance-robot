@@ -1,0 +1,213 @@
+## 🧠 Code Explained — How It Actually Works
+
+---
+
+### 📦 Libraries Used
+
+```cpp
+#include <SoftwareSerial.h>   // Bluetooth communication on pins 2,3
+#include <Servo.h>            // Controls servo motor on pin 10
+```
+
+🔵 **SoftwareSerial** — Arduino Uno has only one hardware serial port
+(used by USB). SoftwareSerial creates a second serial port on any
+digital pins. Here we use D2 (RX) and D3 (TX) for Bluetooth.
+
+🔵 **Servo** — Controls the SG90 servo that rotates the ultrasonic
+sensor left and right for scanning.
+
+---
+
+### 📍 Pin Setup
+
+```cpp
+#define IN1 4  #define IN2 5   // Left motors
+#define IN3 6  #define IN4 7   // Right motors
+#define BUZZER 8               // Active buzzer
+#define LED    9               // Headlight LED
+#define SERVO_PIN 10           // Servo signal wire
+#define TRIG   11              // Ultrasonic trigger
+#define ECHO   12              // Ultrasonic echo
+```
+
+🗺️ Think of this as the map. Every component has its own
+dedicated Arduino pin. Changing a wire? Just change the
+number here — no need to hunt through the whole code.
+
+---
+
+### 🎛️ Tuning Parameters
+
+```cpp
+#define OBSTACLE_DIST    35   // Stop if object closer than 35cm
+#define SIDE_CLEAR_DIST  25   // Side is "open" only if > 25cm
+#define SERVO_CENTER     90   // Servo straight ahead
+#define SERVO_LEFT      160   // Servo looking left
+#define SERVO_RIGHT      20   // Servo looking right
+#define SERVO_SETTLE    500   // Wait 500ms after servo moves
+#define TURN_TIME       800   // Turn for 800ms
+#define REVERSE_TIME    600   // Reverse for 600ms
+#define AUTO_CLEAR_TIME 800   // Move forward 800ms to clear obstacle
+```
+
+🎚️ These are your tuning knobs. Robot stopping too early?
+Increase `OBSTACLE_DIST`. Not turning enough? Increase
+`TURN_TIME`. Servo overshooting? Adjust `SERVO_LEFT` and
+`SERVO_RIGHT` until it points correctly.
+
+---
+
+### 🧩 The State Machine — Brain of the Robot
+
+The robot doesn't use `delay()` anywhere in its main logic.
+Instead it uses a **state machine** — a list of stages the
+robot moves through one at a time.
+
+```cpp
+enum AutoState {
+  AUTO_FORWARD,          // 🚗 Moving forward
+  AUTO_OBSTACLE_BEEP,    // 🔔 Obstacle found — beep!
+  AUTO_SCAN_LEFT,        // 👈 Servo turns left
+  AUTO_SCAN_LEFT_WAIT,   // ⏳ Wait for servo to settle
+  AUTO_READ_LEFT,        // 📏 Read left distance
+  AUTO_SCAN_RIGHT,       // 👉 Servo turns right
+  AUTO_SCAN_RIGHT_WAIT,  // ⏳ Wait for servo to settle
+  AUTO_READ_RIGHT,       // 📏 Read right distance
+  AUTO_CENTER_SERVO,     // ⬆️ Servo back to center
+  AUTO_CENTER_WAIT,      // ⏳ Wait for center
+  AUTO_DECIDE,           // 🧠 Which way to go?
+  AUTO_REVERSE,          // ⬅️ Both blocked — go back
+  AUTO_REVERSE_WAIT,     // ⏳ Wait while reversing
+  AUTO_SCAN2_LEFT,       // 👈 Scan left again after reverse
+  ...
+  AUTO_TURN,             // 🔄 Turn toward open side
+  AUTO_TURN_WAIT,        // ⏳ Wait while turning
+  AUTO_CLEAR,            // 🚗 Move forward past obstacle
+  AUTO_CLEAR_WAIT,       // ⏳ Wait while clearing
+  AUTO_RESUME_CENTER,    // ⬆️ Center servo again
+  AUTO_RESUME_CENTER_WAIT// ⏳ Wait then go back to AUTO_FORWARD
+};
+```
+
+💡 **Why not use delay()?**
+`delay()` freezes the entire Arduino. While waiting, it
+can't read Bluetooth, can't update buzzer, can't do anything.
+With a state machine — each state does ONE thing and returns
+immediately. Everything runs in parallel smoothly.
+
+---
+
+### 📡 How Distance Is Measured
+
+```cpp
+long getDistance() {
+  digitalWrite(TRIG, LOW);
+  delayMicroseconds(4);
+  digitalWrite(TRIG, HIGH);   // Send ultrasonic pulse
+  delayMicroseconds(10);
+  digitalWrite(TRIG, LOW);
+  long dur = pulseIn(ECHO, HIGH, 30000);  // Wait for echo
+  total += (dur == 0) ? 300 : dur * 0.034 / 2;
+}
+```
+
+📡 **How ultrasonic sensing works:**
+
+Power ON
+↓
+Servo sweeps: CENTER → LEFT → RIGHT → CENTER
+(alignment confirmation)
+↓
+Send 'V' from Bluetooth app
+↓
+┌─────────────────────────────────┐
+│  AUTO_FORWARD                   │
+│  Motors running forward         │
+│  Ultrasonic checks distance     │
+│  every loop iteration           │
+└────────────┬────────────────────┘
+│ Object detected < 35cm
+↓
+Motors STOP
+Buzzer BEEPS 400ms
+↓
+Servo → LEFT (160°)
+Wait 500ms
+Read distance → store as distLeft
+↓
+Servo → RIGHT (20°)
+Wait 500ms
+Read distance → store as distRight
+↓
+Servo → CENTER (90°)
+Wait 350ms
+↓
+🧠 DECIDE:
+┌────────────────────────────────┐
+│ distLeft > distRight?          │
+│   → Turn LEFT                 │
+│ distRight > distLeft?          │
+│   → Turn RIGHT                │
+│ Both < 25cm (both blocked)?    │
+│   → REVERSE 600ms             │
+│   → Scan LEFT + RIGHT again   │
+│   → Pick whichever is larger  │
+│   → Turn that way             │
+└────────────────────────────────┘
+↓
+Turn for 800ms
+↓
+Forward for 800ms (clear obstacle)
+↓
+Servo → CENTER
+↓
+Back to AUTO_FORWARD ↺
+
+
+
+---
+
+### 📱 Bluetooth Mode Switching
+
+```cpp
+case 'V':
+  autonomousMode = true;    // 🤖 Robot takes over
+  forward();
+  break;
+
+case 'v':
+  autonomousMode = false;   // 👨 You take over
+  stopMotors();
+  break;
+```
+
+🔄 **Two modes, one robot:**
+- **Manual BT Mode** — You drive. Robot just listens to commands.
+  No sensors, no servo, no auto anything.
+- **Autonomous Mode** — Robot drives itself. Bluetooth only
+  listens for `V`/`v`/`M` to switch modes. All other commands
+  ignored while autonomous.
+
+---
+
+### ⚠️ Why Servo Detach Matters
+
+```cpp
+// Entering autonomous — attach servo
+scanner.attach(SERVO_PIN);
+
+// Exiting autonomous — detach servo
+scanner.write(SERVO_CENTER);
+delay(400);
+scanner.detach();   // ← THIS IS CRITICAL
+```
+
+⚡ **The conflict:**
+Arduino Uno has limited hardware timers. Both the Servo
+library and SoftwareSerial (Bluetooth) share **Timer1**.
+When servo stays attached permanently, it disrupts the
+timer and Bluetooth commands randomly stop working.
+
+✅ **The fix:** Attach servo ONLY during autonomous mode.
+Detach when returning to manual mode. This frees Timer1
+completely for Bluetooth — same as if servo never existed.
