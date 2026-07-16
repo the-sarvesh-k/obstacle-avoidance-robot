@@ -1,0 +1,643 @@
+##FULL CODE 
+
+#include <SoftwareSerial.h>
+#include <Servo.h>
+
+SoftwareSerial BT(2, 3);
+Servo scanner;
+
+// ── Pins ──
+#define IN1        4
+#define IN2        5
+#define IN3        6
+#define IN4        7
+#define BUZZER     8
+#define LED        9
+#define SERVO_PIN  10
+#define TRIG       11
+#define ECHO       12
+
+// ── Tuning ──
+#define OBSTACLE_DIST    35   // cm front detection
+#define SIDE_CLEAR_DIST  25   // cm left/right must be clear
+#define SERVO_CENTER     90
+#define SERVO_LEFT      160
+#define SERVO_RIGHT      20
+#define SERVO_SETTLE    500   // ms wait after servo moves
+#define TURN_TIME       800   // ms car turns
+#define REVERSE_TIME    600   // ms reverse when both sides blocked
+#define AUTO_CLEAR_TIME 800   // ms drive forward after turn
+
+// ── Existing State ──
+unsigned long lastCommandTime = 0;
+const unsigned long TIMEOUT   = 900;
+
+bool parkingMode   = false;
+bool emergencyMode = false;
+bool headlightOn   = false;
+
+// ── Truck Horn ──
+bool hornActive = false;
+int  hornStep   = 0;
+unsigned long hornTimer = 0;
+const int truckHornPattern[][2] = {
+  {HIGH, 300}, {LOW, 100},
+  {HIGH, 500}, {LOW, 100},
+  {HIGH, 400}, {LOW,   0}
+};
+
+// ── Parking Beep ──
+bool parkingBeepActive = false;
+int  parkingBeepStep   = 0;
+unsigned long parkingBeepTimer = 0;
+const int parkingBeepPattern[][2] = {
+  {HIGH, 200}, {LOW, 150},
+  {HIGH, 200}, {LOW,   0}
+};
+
+// ── Emergency ──
+unsigned long emergencyTimer     = 0;
+bool emergencyBuzzerState        = false;
+bool emergencyLedState           = false;
+
+// ── Mode ──
+bool autonomousMode = false;   // 'V' only
+
+// ── Autonomous State Machine ──
+enum AutoState {
+  AUTO_FORWARD,
+  AUTO_OBSTACLE_BEEP,      // beep on detection
+  AUTO_SCAN_LEFT,          // servo moves left
+  AUTO_SCAN_LEFT_WAIT,     // wait for servo to settle
+  AUTO_READ_LEFT,          // read left distance
+  AUTO_SCAN_RIGHT,         // servo moves right
+  AUTO_SCAN_RIGHT_WAIT,    // wait for servo to settle
+  AUTO_READ_RIGHT,         // read right distance
+  AUTO_CENTER_SERVO,       // servo back to center
+  AUTO_CENTER_WAIT,        // wait for center
+  AUTO_DECIDE,             // decide: turn left/right/reverse
+  AUTO_REVERSE,            // reverse when both sides blocked
+  AUTO_REVERSE_WAIT,       // wait reverse time
+  AUTO_SCAN2_LEFT,         // second scan left after reverse
+  AUTO_SCAN2_LEFT_WAIT,
+  AUTO_READ2_LEFT,
+  AUTO_SCAN2_RIGHT,
+  AUTO_SCAN2_RIGHT_WAIT,
+  AUTO_READ2_RIGHT,
+  AUTO_CENTER2_SERVO,
+  AUTO_CENTER2_WAIT,
+  AUTO_DECIDE2,            // final decide after reverse
+  AUTO_TURN,               // car turns
+  AUTO_TURN_WAIT,          // wait turn time
+  AUTO_CLEAR,              // drive forward to clear
+  AUTO_CLEAR_WAIT,         // wait clear time
+  AUTO_RESUME_CENTER,      // center servo before resuming
+  AUTO_RESUME_CENTER_WAIT
+};
+
+AutoState autoState = AUTO_FORWARD;
+unsigned long autoTimer = 0;
+long distLeft   = 0;
+long distRight  = 0;
+long dist2Left  = 0;
+long dist2Right = 0;
+bool autoTurnLeft = true;
+
+// ─────────────────────────────────────────
+//  DISTANCE — average 3 readings for reliability
+// ─────────────────────────────────────────
+long getDistance() {
+  long total = 0;
+  for (int i = 0; i < 3; i++) {
+    digitalWrite(TRIG, LOW);
+    delayMicroseconds(4);
+    digitalWrite(TRIG, HIGH);
+    delayMicroseconds(10);
+    digitalWrite(TRIG, LOW);
+    long dur = pulseIn(ECHO, HIGH, 30000);
+    total += (dur == 0) ? 300 : dur * 0.034 / 2;
+    delay(10);
+  }
+  return total / 3;
+}
+
+// ─────────────────────────────────────────
+//  SAFE BUZZER
+// ─────────────────────────────────────────
+void safeBuzzerOn() {
+  if (!emergencyMode && !hornActive && !parkingBeepActive)
+    digitalWrite(BUZZER, HIGH);
+}
+void safeBuzzerOff() {
+  if (!emergencyMode && !hornActive && !parkingBeepActive)
+    digitalWrite(BUZZER, LOW);
+}
+
+// ─────────────────────────────────────────
+//  SETUP
+// ─────────────────────────────────────────
+void setup() {
+  BT.begin(9600);
+  Serial.begin(9600);
+
+  pinMode(IN1,    OUTPUT);
+  pinMode(IN2,    OUTPUT);
+  pinMode(IN3,    OUTPUT);
+  pinMode(IN4,    OUTPUT);
+  pinMode(BUZZER, OUTPUT);
+  pinMode(LED,    OUTPUT);
+  pinMode(TRIG,   OUTPUT);
+  pinMode(ECHO,   INPUT);
+
+  scanner.attach(SERVO_PIN);
+
+  // Startup alignment sweep
+  Serial.println("Servo alignment...");
+  scanner.write(SERVO_CENTER); delay(400);
+  scanner.write(SERVO_LEFT);   delay(700);
+  scanner.write(SERVO_RIGHT);  delay(700);
+  scanner.write(SERVO_CENTER); delay(500);
+  Serial.println("Ready");
+
+  digitalWrite(LED,    LOW);
+  digitalWrite(BUZZER, LOW);
+  stopMotors();
+}
+
+// ─────────────────────────────────────────
+//  LOOP
+// ─────────────────────────────────────────
+void loop() {
+  handleHorn();
+  handleParkingBeep();
+  handleEmergency();
+
+  if (autonomousMode) {
+    handleAutonomous();
+    readBT();       // listen for mode switch even in auto
+    return;
+  }
+
+  // Manual BT mode — normal timeout auto-stop
+  if (!parkingMode) {
+    if (millis() - lastCommandTime > TIMEOUT) {
+      stopMotors();
+    }
+  }
+
+  readBT();
+}
+
+// ─────────────────────────────────────────
+//  BLUETOOTH READER
+// ─────────────────────────────────────────
+void readBT() {
+  if (!BT.available()) return;
+  char cmd = BT.read();
+  Serial.println(cmd);
+
+  switch (cmd) {
+
+    // Movement — blocked only in parking
+    case 'F':
+      if (!parkingMode && !autonomousMode) {
+        forward(); lastCommandTime = millis();
+      }
+      break;
+    case 'B':
+      if (!parkingMode && !autonomousMode) {
+        backward(); lastCommandTime = millis();
+      }
+      break;
+    case 'L':
+      if (!parkingMode && !autonomousMode) {
+        left(); lastCommandTime = millis();
+      }
+      break;
+    case 'R':
+      if (!parkingMode && !autonomousMode) {
+        right(); lastCommandTime = millis();
+      }
+      break;
+    case 'S':
+      if (!parkingMode && !autonomousMode) {
+        stopMotors(); lastCommandTime = 0;
+      }
+      break;
+
+    // Headlight
+    case 'U':
+      headlightOn = true;
+      if (!emergencyMode) digitalWrite(LED, HIGH);
+      Serial.println("Light ON");
+      break;
+    case 'u':
+      headlightOn = false;
+      if (!emergencyMode) digitalWrite(LED, LOW);
+      Serial.println("Light OFF");
+      break;
+
+    // Parking
+    case 'W':
+      parkingMode     = true;
+      autonomousMode  = false;
+      stopMotors();
+      startParkingBeep();
+      Serial.println("Parking ON");
+      break;
+    case 'w':
+      parkingMode     = false;
+      lastCommandTime = millis();
+      startParkingBeep();
+      Serial.println("Parking OFF");
+      break;
+
+    // Emergency
+    case 'X':
+      emergencyMode        = true;
+      emergencyTimer       = millis();
+      emergencyBuzzerState = true;
+      emergencyLedState    = true;
+      digitalWrite(BUZZER, HIGH);
+      digitalWrite(LED,    HIGH);
+      Serial.println("Emergency ON");
+      break;
+    case 'x':
+      emergencyMode = false;
+      digitalWrite(BUZZER, LOW);
+      digitalWrite(LED, headlightOn ? HIGH : LOW);
+      Serial.println("Emergency OFF");
+      break;
+
+    // Horn
+    case 'Y':
+      if (!hornActive && !parkingBeepActive) {
+        hornStep   = 0;
+        hornActive = true;
+        hornTimer  = millis();
+        digitalWrite(BUZZER, HIGH);
+        Serial.println("Horn ON");
+      }
+      break;
+
+    // 'V' → Fully Autonomous
+    case 'V':
+      autonomousMode  = true;
+      parkingMode     = false;
+      autoState       = AUTO_FORWARD;
+      scanner.write(SERVO_CENTER);
+      delay(300);
+      forward();
+      Serial.println("Autonomous ON");
+      break;
+
+    // 'v' → Manual BT mode (no avoidance)
+    case 'v':
+      autonomousMode  = false;
+      stopMotors();
+      scanner.write(SERVO_CENTER);
+      lastCommandTime = millis();
+      Serial.println("Manual BT Mode");
+      break;
+
+    // 'M' → Manual fallback
+    case 'M':
+      autonomousMode  = false;
+      stopMotors();
+      scanner.write(SERVO_CENTER);
+      lastCommandTime = millis();
+      Serial.println("Manual Mode");
+      break;
+  }
+}
+
+// ─────────────────────────────────────────
+//  AUTONOMOUS HANDLER
+// ─────────────────────────────────────────
+void handleAutonomous() {
+  switch (autoState) {
+
+    // ── Driving forward — keep checking distance ──
+    case AUTO_FORWARD: {
+      long dist = getDistance();
+      Serial.print("Fwd dist: "); Serial.println(dist);
+      if (dist <= OBSTACLE_DIST) {
+        stopMotors();
+        safeBuzzerOn();
+        autoTimer = millis();
+        autoState = AUTO_OBSTACLE_BEEP;
+        Serial.println("Obstacle! Beeping...");
+      }
+      break;
+    }
+
+    // ── Beep 400ms then start scan ──
+    case AUTO_OBSTACLE_BEEP:
+      if (millis() - autoTimer >= 400) {
+        safeBuzzerOff();
+        autoState = AUTO_SCAN_LEFT;
+      }
+      break;
+
+    // ── Servo → LEFT ──
+    case AUTO_SCAN_LEFT:
+      scanner.write(SERVO_LEFT);
+      autoTimer = millis();
+      autoState = AUTO_SCAN_LEFT_WAIT;
+      Serial.println("Scanning left...");
+      break;
+
+    case AUTO_SCAN_LEFT_WAIT:
+      if (millis() - autoTimer >= SERVO_SETTLE) {
+        autoState = AUTO_READ_LEFT;
+      }
+      break;
+
+    case AUTO_READ_LEFT:
+      distLeft  = getDistance();
+      Serial.print("Left: "); Serial.println(distLeft);
+      autoState = AUTO_SCAN_RIGHT;
+      break;
+
+    // ── Servo → RIGHT ──
+    case AUTO_SCAN_RIGHT:
+      scanner.write(SERVO_RIGHT);
+      autoTimer = millis();
+      autoState = AUTO_SCAN_RIGHT_WAIT;
+      Serial.println("Scanning right...");
+      break;
+
+    case AUTO_SCAN_RIGHT_WAIT:
+      if (millis() - autoTimer >= SERVO_SETTLE) {
+        autoState = AUTO_READ_RIGHT;
+      }
+      break;
+
+    case AUTO_READ_RIGHT:
+      distRight = getDistance();
+      Serial.print("Right: "); Serial.println(distRight);
+      autoState = AUTO_CENTER_SERVO;
+      break;
+
+    // ── Servo → CENTER ──
+    case AUTO_CENTER_SERVO:
+      scanner.write(SERVO_CENTER);
+      autoTimer = millis();
+      autoState = AUTO_CENTER_WAIT;
+      break;
+
+    case AUTO_CENTER_WAIT:
+      if (millis() - autoTimer >= 350) {
+        autoState = AUTO_DECIDE;
+      }
+      break;
+
+    // ── Decide ──
+    // If both sides blocked → reverse then scan again
+    // Else → turn toward open side
+    case AUTO_DECIDE:
+      Serial.print("Deciding L:"); Serial.print(distLeft);
+      Serial.print(" R:"); Serial.println(distRight);
+
+      if (distLeft <= SIDE_CLEAR_DIST && distRight <= SIDE_CLEAR_DIST) {
+        // Both blocked — reverse
+        Serial.println("Both blocked! Reversing...");
+        backward();
+        autoTimer = millis();
+        autoState = AUTO_REVERSE;
+      } else {
+        // At least one side open
+        autoTurnLeft = (distLeft >= distRight);
+        Serial.println(autoTurnLeft ? "Turning LEFT" : "Turning RIGHT");
+        if (autoTurnLeft) left(); else right();
+        autoTimer = millis();
+        autoState = AUTO_TURN;
+      }
+      break;
+
+    // ── Reverse ──
+    case AUTO_REVERSE:
+      // Keep reversing
+      break;
+
+    case AUTO_REVERSE_WAIT:
+      if (millis() - autoTimer >= REVERSE_TIME) {
+        stopMotors();
+        autoState = AUTO_SCAN2_LEFT;
+        Serial.println("Reverse done — scanning again...");
+      }
+      break;
+
+    // ── Second scan after reverse ──
+    case AUTO_SCAN2_LEFT:
+      scanner.write(SERVO_LEFT);
+      autoTimer = millis();
+      autoState = AUTO_SCAN2_LEFT_WAIT;
+      break;
+
+    case AUTO_SCAN2_LEFT_WAIT:
+      if (millis() - autoTimer >= SERVO_SETTLE) {
+        autoState = AUTO_READ2_LEFT;
+      }
+      break;
+
+    case AUTO_READ2_LEFT:
+      dist2Left = getDistance();
+      Serial.print("2nd Left: "); Serial.println(dist2Left);
+      autoState = AUTO_SCAN2_RIGHT;
+      break;
+
+    case AUTO_SCAN2_RIGHT:
+      scanner.write(SERVO_RIGHT);
+      autoTimer = millis();
+      autoState = AUTO_SCAN2_RIGHT_WAIT;
+      break;
+
+    case AUTO_SCAN2_RIGHT_WAIT:
+      if (millis() - autoTimer >= SERVO_SETTLE) {
+        autoState = AUTO_READ2_RIGHT;
+      }
+      break;
+
+    case AUTO_READ2_RIGHT:
+      dist2Right = getDistance();
+      Serial.print("2nd Right: "); Serial.println(dist2Right);
+      autoState = AUTO_CENTER2_SERVO;
+      break;
+
+    case AUTO_CENTER2_SERVO:
+      scanner.write(SERVO_CENTER);
+      autoTimer = millis();
+      autoState = AUTO_CENTER2_WAIT;
+      break;
+
+    case AUTO_CENTER2_WAIT:
+      if (millis() - autoTimer >= 350) {
+        autoState = AUTO_DECIDE2;
+      }
+      break;
+
+    case AUTO_DECIDE2:
+      Serial.print("Final L:"); Serial.print(dist2Left);
+      Serial.print(" R:"); Serial.println(dist2Right);
+      // Pick whichever side has more space
+      autoTurnLeft = (dist2Left >= dist2Right);
+      Serial.println(autoTurnLeft ? "Final: LEFT" : "Final: RIGHT");
+      if (autoTurnLeft) left(); else right();
+      autoTimer = millis();
+      autoState = AUTO_TURN;
+      break;
+
+    // ── Turn ──
+    case AUTO_TURN:
+      // Turning — just waiting
+      break;
+
+    case AUTO_TURN_WAIT:
+      if (millis() - autoTimer >= TURN_TIME) {
+        forward();
+        autoTimer = millis();
+        autoState = AUTO_CLEAR;
+        Serial.println("Turn done — clearing...");
+      }
+      break;
+
+    // ── Drive forward to clear obstacle ──
+    case AUTO_CLEAR:
+      // Moving forward
+      break;
+
+    case AUTO_CLEAR_WAIT:
+      if (millis() - autoTimer >= AUTO_CLEAR_TIME) {
+        autoState = AUTO_RESUME_CENTER;
+      }
+      break;
+
+    // ── Center servo then resume ──
+    case AUTO_RESUME_CENTER:
+      scanner.write(SERVO_CENTER);
+      autoTimer = millis();
+      autoState = AUTO_RESUME_CENTER_WAIT;
+      break;
+
+    case AUTO_RESUME_CENTER_WAIT:
+      if (millis() - autoTimer >= 300) {
+        autoState = AUTO_FORWARD;
+        Serial.println("Resuming forward...");
+      }
+      break;
+  }
+
+  // ── State transitions that need timing ──
+  // (these run every loop iteration)
+  if (autoState == AUTO_REVERSE) {
+    backward();
+    autoTimer = millis();
+    autoState = AUTO_REVERSE_WAIT;
+  }
+  if (autoState == AUTO_TURN) {
+    autoTimer = millis();
+    autoState = AUTO_TURN_WAIT;
+  }
+  if (autoState == AUTO_CLEAR) {
+    forward();
+    autoTimer = millis();
+    autoState = AUTO_CLEAR_WAIT;
+  }
+}
+
+// ─────────────────────────────────────────
+//  HORN
+// ─────────────────────────────────────────
+void handleHorn() {
+  if (!hornActive) return;
+  if (truckHornPattern[hornStep][1] == 0) {
+    hornActive = false;
+    if (!emergencyMode) digitalWrite(BUZZER, LOW);
+    return;
+  }
+  if (millis() - hornTimer >= truckHornPattern[hornStep][1]) {
+    hornTimer = millis();
+    hornStep++;
+    if (truckHornPattern[hornStep][1] == 0) {
+      hornActive = false;
+      if (!emergencyMode) digitalWrite(BUZZER, LOW);
+      return;
+    }
+    digitalWrite(BUZZER, truckHornPattern[hornStep][0]);
+  }
+}
+
+// ─────────────────────────────────────────
+//  PARKING BEEP
+// ─────────────────────────────────────────
+void startParkingBeep() {
+  parkingBeepStep   = 0;
+  parkingBeepActive = true;
+  parkingBeepTimer  = millis();
+  digitalWrite(BUZZER, HIGH);
+}
+
+void handleParkingBeep() {
+  if (!parkingBeepActive) return;
+  if (parkingBeepPattern[parkingBeepStep][1] == 0) {
+    parkingBeepActive = false;
+    if (!emergencyMode && !hornActive) digitalWrite(BUZZER, LOW);
+    return;
+  }
+  if (millis() - parkingBeepTimer >= parkingBeepPattern[parkingBeepStep][1]) {
+    parkingBeepTimer = millis();
+    parkingBeepStep++;
+    if (parkingBeepPattern[parkingBeepStep][1] == 0) {
+      parkingBeepActive = false;
+      if (!emergencyMode && !hornActive) digitalWrite(BUZZER, LOW);
+      return;
+    }
+    digitalWrite(BUZZER, parkingBeepPattern[parkingBeepStep][0]);
+  }
+}
+
+// ─────────────────────────────────────────
+//  EMERGENCY
+// ─────────────────────────────────────────
+void handleEmergency() {
+  if (!emergencyMode) return;
+  if (hornActive || parkingBeepActive) return;
+
+  unsigned long elapsed = millis() - emergencyTimer;
+  bool newBuzzer = (elapsed / 300) % 2 == 0;
+  bool newLed    = (elapsed / 150) % 2 == 0;
+
+  if (newBuzzer != emergencyBuzzerState) {
+    emergencyBuzzerState = newBuzzer;
+    digitalWrite(BUZZER, emergencyBuzzerState ? HIGH : LOW);
+  }
+  if (newLed != emergencyLedState) {
+    emergencyLedState = newLed;
+    digitalWrite(LED, emergencyLedState ? HIGH : LOW);
+  }
+}
+
+// ─────────────────────────────────────────
+//  MOTOR FUNCTIONS
+// ─────────────────────────────────────────
+void forward() {
+  digitalWrite(IN1, HIGH); digitalWrite(IN2, LOW);
+  digitalWrite(IN3, HIGH); digitalWrite(IN4, LOW);
+}
+void backward() {
+  digitalWrite(IN1, LOW);  digitalWrite(IN2, HIGH);
+  digitalWrite(IN3, LOW);  digitalWrite(IN4, HIGH);
+}
+void left() {
+  digitalWrite(IN1, LOW);  digitalWrite(IN2, HIGH);
+  digitalWrite(IN3, HIGH); digitalWrite(IN4, LOW);
+}
+void right() {
+  digitalWrite(IN1, HIGH); digitalWrite(IN2, LOW);
+  digitalWrite(IN3, LOW);  digitalWrite(IN4, HIGH);
+}
+void stopMotors() {
+  digitalWrite(IN1, LOW); digitalWrite(IN2, LOW);
+  digitalWrite(IN3, LOW); digitalWrite(IN4, LOW);
+}
